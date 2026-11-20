@@ -126,6 +126,7 @@ HELP_TEXT = """
 <tr><td><b>+ / −</b>, Ctrl + колесо</td><td>увеличить / уменьшить фото</td></tr>
 <tr><td><b>0</b> / <b>1</b></td><td>фото по размеру окна / 100%</td></tr>
 <tr><td><b>R</b> / <b>Shift+R</b></td><td>повернуть фото вправо / влево</td></tr>
+<tr><td><b>C</b> / <b>Ctrl+2</b></td><td>сравнить 2 фото рядом / выбрать второе фото</td></tr>
 <tr><td><b>S</b></td><td>слайд-шоу</td></tr>
 <tr><td><b>F</b>, F11, двойной клик</td><td>во весь экран</td></tr>
 <tr><td><b>Esc</b></td><td>выйти из полноэкранного режима</td></tr>
@@ -170,7 +171,9 @@ class ImageView(QGraphicsView):
     """Просмотр фото: зум, перетаскивание, поворот."""
     stepRequested = Signal(int)
     zoomChanged = Signal(float)
+    viewChanged = Signal()
     doubleClicked = Signal()
+    activated = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -180,6 +183,7 @@ class ImageView(QGraphicsView):
         self._zoom = 1.0
         self._fit = True
         self._rotation = 0
+        self._internal_update = False
         self.setBackgroundBrush(QColor(COLOR_BG))
         self.setDragMode(QGraphicsView.ScrollHandDrag)
         self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
@@ -190,16 +194,26 @@ class ImageView(QGraphicsView):
         # перетаскивание файлов обрабатывает главное окно
         self.setAcceptDrops(False)
         self.viewport().setAcceptDrops(False)
+        self.horizontalScrollBar().valueChanged.connect(self._on_scroll)
+        self.verticalScrollBar().valueChanged.connect(self._on_scroll)
+
+    def _on_scroll(self, _value):
+        if not self._internal_update and self.item is not None:
+            self.viewChanged.emit()
 
     def set_image(self, pixmap):
-        self._scene.clear()
-        self.item = self._scene.addPixmap(pixmap)
-        self.item.setTransformationMode(Qt.SmoothTransformation)
-        self.item.setTransformOriginPoint(self.item.boundingRect().center())
-        self._scene.setSceneRect(self.item.sceneBoundingRect())
-        self._rotation = 0
-        self._fit = True
-        self._apply_fit()
+        self._internal_update = True
+        try:
+            self._scene.clear()
+            self.item = self._scene.addPixmap(pixmap)
+            self.item.setTransformationMode(Qt.SmoothTransformation)
+            self.item.setTransformOriginPoint(self.item.boundingRect().center())
+            self._scene.setSceneRect(self.item.sceneBoundingRect())
+            self._rotation = 0
+            self._fit = True
+            self._apply_fit()
+        finally:
+            self._internal_update = False
 
     def update_frame(self, pixmap):
         """Новый кадр анимации — без сброса масштаба."""
@@ -213,25 +227,75 @@ class ImageView(QGraphicsView):
     def has_image(self):
         return self.item is not None
 
+    def fit_scale(self):
+        if not self.item:
+            return 1.0
+        rect = self.item.sceneBoundingRect()
+        s = min(self.viewport().width() / max(1, rect.width()),
+                self.viewport().height() / max(1, rect.height()))
+        return max(min(s, 1.0), 0.01)  # маленькие фото не растягиваем
+
+    def get_view_state(self):
+        if not self.item:
+            return None
+        rect = self.item.sceneBoundingRect()
+        center = self.mapToScene(self.viewport().rect().center())
+        nx = (center.x() - rect.left()) / max(1.0, rect.width())
+        ny = (center.y() - rect.top()) / max(1.0, rect.height())
+        rel = self._zoom / max(0.01, self.fit_scale())
+        return (self._fit, rel, nx, ny)
+
+    def apply_view_state(self, state):
+        if not self.item or state is None:
+            return
+        fit, rel, nx, ny = state
+        self._internal_update = True
+        try:
+            if fit:
+                self._fit = True
+                self._apply_fit()
+            else:
+                self._fit = False
+                new_zoom = max(0.02, min(20.0, rel * self.fit_scale()))
+                self._zoom = new_zoom
+                self.resetTransform()
+                self.scale(new_zoom, new_zoom)
+                rect = self.item.sceneBoundingRect()
+                self.centerOn(rect.left() + nx * rect.width(),
+                              rect.top() + ny * rect.height())
+                self.zoomChanged.emit(self._zoom)
+        finally:
+            self._internal_update = False
+
     def _set_zoom(self, new_zoom):
         new_zoom = max(0.02, min(20.0, new_zoom))
         factor = new_zoom / self._zoom
         self._zoom = new_zoom
-        self.scale(factor, factor)
-        self.zoomChanged.emit(self._zoom)
+        prev = self._internal_update
+        self._internal_update = True
+        try:
+            self.scale(factor, factor)
+            self.zoomChanged.emit(self._zoom)
+        finally:
+            self._internal_update = prev
+        if not self._internal_update:
+            self.viewChanged.emit()
 
     def _apply_fit(self):
         if not self.item or not self._fit:
             return
-        self.resetTransform()
-        rect = self.item.sceneBoundingRect()
-        s = min(self.viewport().width() / max(1, rect.width()),
-                self.viewport().height() / max(1, rect.height()))
-        s = max(min(s, 1.0), 0.01)  # маленькие фото не растягиваем
-        self._zoom = s
-        self.scale(s, s)
-        self.centerOn(rect.center())
-        self.zoomChanged.emit(self._zoom)
+        prev = self._internal_update
+        self._internal_update = True
+        try:
+            self.resetTransform()
+            rect = self.item.sceneBoundingRect()
+            s = self.fit_scale()
+            self._zoom = s
+            self.scale(s, s)
+            self.centerOn(rect.center())
+            self.zoomChanged.emit(self._zoom)
+        finally:
+            self._internal_update = prev
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
@@ -271,25 +335,41 @@ class ImageView(QGraphicsView):
         if self.item:
             self._fit = True
             self._apply_fit()
+            self.viewChanged.emit()
 
     def zoom_100(self):
         if self.item:
-            self._fit = False
-            self._zoom = 1.0
-            self.resetTransform()
-            self.centerOn(self.item.sceneBoundingRect().center())
-            self.zoomChanged.emit(1.0)
+            prev = self._internal_update
+            self._internal_update = True
+            try:
+                self._fit = False
+                self._zoom = 1.0
+                self.resetTransform()
+                self.centerOn(self.item.sceneBoundingRect().center())
+                self.zoomChanged.emit(1.0)
+            finally:
+                self._internal_update = prev
+            self.viewChanged.emit()
 
     def rotate(self, deg):
         if not self.item:
             return
-        self._rotation = (self._rotation + deg) % 360
-        self.item.setRotation(self._rotation)
-        self._scene.setSceneRect(self.item.sceneBoundingRect())
-        if self._fit:
-            self._apply_fit()
-        else:
-            self.centerOn(self.item.sceneBoundingRect().center())
+        prev = self._internal_update
+        self._internal_update = True
+        try:
+            self._rotation = (self._rotation + deg) % 360
+            self.item.setRotation(self._rotation)
+            self._scene.setSceneRect(self.item.sceneBoundingRect())
+            if self._fit:
+                self._apply_fit()
+            else:
+                self.centerOn(self.item.sceneBoundingRect().center())
+        finally:
+            self._internal_update = prev
+
+    def mousePressEvent(self, e):
+        self.activated.emit()
+        super().mousePressEvent(e)
 
     def mouseDoubleClickEvent(self, e):
         if e.button() == Qt.LeftButton:
@@ -448,6 +528,14 @@ class MediaPlayer(QMainWindow):
         self.player = None
         self.audio_output = None
         self.movie = None
+        self.compare_movie = None
+        self._compare_mode = False
+        self._compare_path = None
+        self._compare_files = []
+        self._compare_size = None
+        self._compare_active = "left"
+        self._compare_sync = True
+        self._syncing_views = False
         self._fullscreen = False
         self._was_maximized = False
         self._closing = False
@@ -487,7 +575,7 @@ class MediaPlayer(QMainWindow):
             self.open_files(files)
 
     # ---------- UI ----------
-    def _btn(self, text, tip, slot=None, icon=None, checkable=False):
+    def _btn(self, text, tip, slot=None, icon=None, checkable=False, obj_name="ToolBtn"):
         b = QToolButton()
         if icon is not None:
             b.setIcon(self.style().standardIcon(icon))
@@ -495,7 +583,7 @@ class MediaPlayer(QMainWindow):
         if text:
             b.setText(text)
         b.setToolTip(tip)
-        b.setObjectName("ToolBtn")
+        b.setObjectName(obj_name)
         b.setCursor(Qt.PointingHandCursor)
         b.setFocusPolicy(Qt.NoFocus)
         b.setCheckable(checkable)
@@ -517,9 +605,19 @@ class MediaPlayer(QMainWindow):
         root.setSpacing(0)
 
         self.image_view = ImageView()
-        self.image_view.stepRequested.connect(self.step_file)
+        self.image_view.stepRequested.connect(
+            lambda d: self.step_image(d) if self._compare_mode else self.step_file(d))
         self.image_view.zoomChanged.connect(lambda z: self._update_status())
+        self.image_view.viewChanged.connect(lambda: self._sync_views(self.image_view, self.compare_view))
         self.image_view.doubleClicked.connect(self.toggle_fullscreen)
+        self.image_view.activated.connect(lambda: self._set_compare_active("left"))
+
+        self.compare_view = ImageView()
+        self.compare_view.stepRequested.connect(self._step_compare_image)
+        self.compare_view.zoomChanged.connect(lambda z: self._update_status())
+        self.compare_view.viewChanged.connect(lambda: self._sync_views(self.compare_view, self.image_view))
+        self.compare_view.doubleClicked.connect(self.toggle_fullscreen)
+        self.compare_view.activated.connect(lambda: self._set_compare_active("right"))
 
         # ----- верхняя панель -----
         self.top_bar = QFrame()
@@ -532,14 +630,16 @@ class MediaPlayer(QMainWindow):
         tl.addWidget(self._btn("📁 Папка", "Открыть всю папку (Ctrl+Shift+O)", self.open_folder_dialog))
         tl.addWidget(self._sep())
 
-        self.btn_zoom_out = self._btn("−", "Уменьшить (−)", self.image_view.zoom_out)
-        self.btn_zoom_in = self._btn("+", "Увеличить (+)", self.image_view.zoom_in)
-        self.btn_fit = self._btn("По окну", "Вписать в окно (0)", self.image_view.zoom_fit)
-        self.btn_100 = self._btn("1:1", "Реальный размер (1)", self.image_view.zoom_100)
-        self.btn_rot_l = self._btn("↺", "Повернуть влево (Shift+R)", lambda: self.image_view.rotate(-90))
-        self.btn_rot_r = self._btn("↻", "Повернуть вправо (R)", lambda: self.image_view.rotate(90))
+        self.btn_zoom_out = self._btn("−", "Уменьшить (−)", self._img_zoom_out)
+        self.btn_zoom_in = self._btn("+", "Увеличить (+)", self._img_zoom_in)
+        self.btn_fit = self._btn("По окну", "Вписать в окно (0)", self._img_zoom_fit)
+        self.btn_100 = self._btn("1:1", "Реальный размер (1)", self._img_zoom_100)
+        self.btn_rot_l = self._btn("↺", "Повернуть влево (Shift+R)", lambda: self._img_rotate(-90))
+        self.btn_rot_r = self._btn("↻", "Повернуть вправо (R)", lambda: self._img_rotate(90))
+        self.btn_compare = self._btn("◫ Сравнить", "Сравнить 2 фото на одном экране (C)",
+                                     self.toggle_compare, checkable=True)
         self.image_tools = [self.btn_zoom_out, self.btn_zoom_in, self.btn_fit,
-                            self.btn_100, self.btn_rot_l, self.btn_rot_r]
+                            self.btn_100, self.btn_rot_l, self.btn_rot_r, self.btn_compare]
         for b in self.image_tools:
             tl.addWidget(b)
 
@@ -593,7 +693,92 @@ class MediaPlayer(QMainWindow):
         hl.addWidget(tip)
         hl.addStretch(1)
         self.stack.addWidget(hint)                    # 0
-        self.stack.addWidget(self.image_view)         # 1
+
+        # страница 1 — фото (обычный режим или сравнение 2 фото рядом)
+        self.image_splitter = QSplitter(Qt.Horizontal)
+        self.image_splitter.setChildrenCollapsible(False)
+
+        self.left_pane = QWidget()
+        lpl = QVBoxLayout(self.left_pane)
+        lpl.setContentsMargins(0, 0, 0, 0)
+        lpl.setSpacing(0)
+        self.left_header = QFrame()
+        self.left_header.setObjectName("CompareHeader")
+        self.left_header.installEventFilter(self)
+        lhl = QHBoxLayout(self.left_header)
+        lhl.setContentsMargins(8, 4, 8, 4)
+        lhl.setSpacing(4)
+        self.left_title = QLabel("Фото 1")
+        self.left_title.setStyleSheet(f"color:{COLOR_TEXT}; font-size:12px; background:transparent;")
+        lhl.addWidget(self.left_title, 1)
+        lhl.addWidget(self._btn("◀", "Предыдущее фото слева", lambda: self.step_image(-1), obj_name="MiniBtn"))
+        lhl.addWidget(self._btn("▶", "Следующее фото слева", lambda: self.step_image(1), obj_name="MiniBtn"))
+        self.left_header.hide()
+        lpl.addWidget(self.left_header)
+        lpl.addWidget(self.image_view, 1)
+        self.image_splitter.addWidget(self.left_pane)
+
+        self.right_pane = QWidget()
+        rpl = QVBoxLayout(self.right_pane)
+        rpl.setContentsMargins(0, 0, 0, 0)
+        rpl.setSpacing(0)
+        self.right_header = QFrame()
+        self.right_header.setObjectName("CompareHeader")
+        self.right_header.installEventFilter(self)
+        rhl = QHBoxLayout(self.right_header)
+        rhl.setContentsMargins(8, 4, 8, 4)
+        rhl.setSpacing(4)
+        self.right_title = QLabel("Выберите второе фото")
+        self.right_title.setStyleSheet(f"color:{COLOR_DIM}; font-size:12px; background:transparent;")
+        rhl.addWidget(self.right_title, 1)
+        rhl.addWidget(self._btn("◀", "Предыдущее фото справа", lambda: self._step_compare_image(-1), obj_name="MiniBtn"))
+        rhl.addWidget(self._btn("▶", "Следующее фото справа", lambda: self._step_compare_image(1), obj_name="MiniBtn"))
+        rhl.addWidget(self._btn("📂 Выбрать", "Выбрать второе фото с диска (Ctrl+2)",
+                                self.choose_compare_image, obj_name="MiniBtn"))
+        rhl.addWidget(self._btn("⇄", "Поменять фото местами", self._swap_compare_images, obj_name="MiniBtn"))
+        self.btn_sync = self._btn("🔗 Синхр.", "Синхронизировать масштаб и перемещение двух фото",
+                                  lambda: self._set_compare_sync(self.btn_sync.isChecked()),
+                                  checkable=True, obj_name="MiniBtn")
+        self.btn_sync.setChecked(True)
+        rhl.addWidget(self.btn_sync)
+        rhl.addWidget(self._btn("✕", "Закрыть сравнение (C)", lambda: self._set_compare_mode(False), obj_name="MiniBtn"))
+        rpl.addWidget(self.right_header)
+
+        self.compare_stack = QStackedWidget()
+        self.compare_placeholder = QWidget()
+        self.compare_placeholder.installEventFilter(self)
+        cpl = QVBoxLayout(self.compare_placeholder)
+        cpl.addStretch(1)
+        self.compare_hint = QLabel("Выберите второе фото для сравнения")
+        self.compare_hint.setAlignment(Qt.AlignCenter)
+        self.compare_hint.setWordWrap(True)
+        self.compare_hint.setStyleSheet(f"color:{COLOR_DIM}; font-size:16px;")
+        cpl.addWidget(self.compare_hint)
+        cprow = QHBoxLayout()
+        cprow.addStretch(1)
+        pb_pick = QPushButton("📂 Выбрать второе фото")
+        pb_pick.setObjectName("BigBtn")
+        pb_pick.setCursor(Qt.PointingHandCursor)
+        pb_pick.setFocusPolicy(Qt.NoFocus)
+        pb_pick.clicked.connect(self.choose_compare_image)
+        cprow.addWidget(pb_pick)
+        cprow.addStretch(1)
+        cpl.addLayout(cprow)
+        cptip = QLabel("Или кликните по фото в списке справа,\nили перетащите файл прямо сюда")
+        cptip.setAlignment(Qt.AlignCenter)
+        cptip.setStyleSheet(f"color:{COLOR_DIM}; font-size:12px; margin-top:8px;")
+        cpl.addWidget(cptip)
+        cpl.addStretch(1)
+        self.compare_stack.addWidget(self.compare_placeholder)  # 0
+        self.compare_stack.addWidget(self.compare_view)         # 1
+        rpl.addWidget(self.compare_stack, 1)
+
+        self.right_pane.hide()
+        self.image_splitter.addWidget(self.right_pane)
+        self.image_splitter.setStretchFactor(0, 1)
+        self.image_splitter.setStretchFactor(1, 1)
+        self.stack.addWidget(self.image_splitter)     # 1
+
         self.video_widget = VideoSurface()
         self.video_widget.clicked.connect(self.toggle_play)
         self.video_widget.doubleClicked.connect(self.toggle_fullscreen)
@@ -640,6 +825,8 @@ class MediaPlayer(QMainWindow):
         sl.addWidget(self.list_title)
         self.file_list = FileList()
         self.file_list.itemClicked.connect(self._list_open)
+        self.file_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.file_list.customContextMenuRequested.connect(self._list_context_menu)
         sl.addWidget(self.file_list)
         self.side.setMinimumWidth(160)
         self.splitter.addWidget(self.side)
@@ -711,6 +898,14 @@ class MediaPlayer(QMainWindow):
         self.setStyleSheet(f"""
             QWidget {{ background: {COLOR_BG}; color: {COLOR_TEXT}; font-size: 13px; }}
             QFrame#TopBar, QFrame#BottomBar {{ background: {COLOR_BG2}; }}
+            QFrame#CompareHeader {{
+                background: {COLOR_BG2};
+                border-top: 2px solid transparent;
+                border-bottom: 1px solid {COLOR_BORDER};
+            }}
+            QFrame#CompareHeader[active="true"] {{
+                border-top: 2px solid {COLOR_ACCENT};
+            }}
             QToolButton#ToolBtn {{
                 background: {COLOR_BG3}; color: {COLOR_TEXT};
                 border: 1px solid {COLOR_BORDER}; border-radius: 6px;
@@ -720,6 +915,13 @@ class MediaPlayer(QMainWindow):
             QToolButton#ToolBtn:pressed, QToolButton#ToolBtn:checked {{ background: #4a4a70; }}
             QToolButton#ToolBtn:disabled {{ color: #5a5a75; background: {COLOR_BG2}; }}
             QToolButton#ToolBtn[popupMode="1"] {{ padding-right: 20px; }}
+            QToolButton#MiniBtn {{
+                background: {COLOR_BG3}; color: {COLOR_TEXT};
+                border: 1px solid {COLOR_BORDER}; border-radius: 5px;
+                padding: 3px 7px; font-size: 12px;
+            }}
+            QToolButton#MiniBtn:hover {{ background: #3d3d5c; }}
+            QToolButton#MiniBtn:pressed, QToolButton#MiniBtn:checked {{ background: #4a4a70; border-color: {COLOR_ACCENT}; }}
             QPushButton#BigBtn {{
                 background: {COLOR_ACCENT}; color: #1e1e2e; border: none;
                 border-radius: 8px; padding: 10px 22px; font-size: 14px; font-weight: 600;
@@ -746,7 +948,7 @@ class MediaPlayer(QMainWindow):
             QMenu::item {{ padding: 5px 18px; }}
             QMenu::item:selected {{ background: {COLOR_ACCENT}; color: #1e1e2e; }}
             QToolTip {{ background: {COLOR_BG3}; color: {COLOR_TEXT}; border: 1px solid {COLOR_BORDER}; }}
-            QSplitter::handle {{ background: {COLOR_BORDER}; width: 1px; }}
+            QSplitter::handle {{ background: {COLOR_BORDER}; width: 2px; }}
         """)
 
     # ---------- Настройки ----------
@@ -803,13 +1005,15 @@ class MediaPlayer(QMainWindow):
         sc("]", lambda: self._speed_step(1))
         sc("[", lambda: self._speed_step(-1))
         sc("Backspace", lambda: self._set_speed(1.0))
-        sc("+", self.image_view.zoom_in)
-        sc("=", self.image_view.zoom_in)
-        sc("-", self.image_view.zoom_out)
-        sc("0", self.image_view.zoom_fit)
-        sc("1", self.image_view.zoom_100)
-        sc("R", lambda: self.image_view.rotate(90))
-        sc("Shift+R", lambda: self.image_view.rotate(-90))
+        sc("+", self._img_zoom_in)
+        sc("=", self._img_zoom_in)
+        sc("-", self._img_zoom_out)
+        sc("0", self._img_zoom_fit)
+        sc("1", self._img_zoom_100)
+        sc("R", lambda: self._img_rotate(90))
+        sc("Shift+R", lambda: self._img_rotate(-90))
+        sc("C", self.toggle_compare)
+        sc("Ctrl+2", self.choose_compare_image)
         sc("S", self.toggle_slideshow)
         sc("F", self.toggle_fullscreen)
         sc("F11", self.toggle_fullscreen)
@@ -936,9 +1140,36 @@ class MediaPlayer(QMainWindow):
 
     def _list_open(self, item):
         i = item.data(Qt.UserRole)
-        if i is not None and i != self.index:
+        if i is None or not (0 <= i < len(self.files)):
+            return
+        if self._compare_mode and self._compare_active == "right" and ext_of(self.files[i]) in IMAGE_EXTS:
+            self._load_compare_image(self.files[i])
+            return
+        if i != self.index:
             self.index = i
             self._load_current()
+
+    def _list_context_menu(self, pos):
+        item = self.file_list.itemAt(pos)
+        if item is None:
+            return
+        i = item.data(Qt.UserRole)
+        if i is None or not (0 <= i < len(self.files)):
+            return
+        path = self.files[i]
+        if ext_of(path) not in IMAGE_EXTS:
+            return
+        menu = QMenu(self)
+        a_right = menu.addAction("◫ Сравнить с этим фото (справа)")
+        a_left = menu.addAction("Открыть слева")
+        chosen = menu.exec(self.file_list.viewport().mapToGlobal(pos))
+        if chosen is a_right:
+            self._open_in_compare_right(path)
+        elif chosen is a_left:
+            self._set_compare_active("left")
+            if i != self.index:
+                self.index = i
+                self._load_current()
 
     def toggle_list(self):
         self._set_list_visible(not self.btn_list.isChecked())
@@ -950,6 +1181,12 @@ class MediaPlayer(QMainWindow):
 
     # ---------- Навигация ----------
     def step_file(self, d):
+        if self._compare_mode:
+            if self._compare_active == "right":
+                self._step_compare_image(d)
+            else:
+                self.step_image(d)
+            return
         if self.files:
             self.index = (self.index + d) % len(self.files)
             self._load_current()
@@ -994,6 +1231,8 @@ class MediaPlayer(QMainWindow):
         self.file_list.scrollToItem(self.file_list.currentItem())
         self.setWindowTitle(f"{os.path.basename(path)} — {APP_NAME}")
         kind = self.current_kind()
+        if kind != "image" and self._compare_mode:
+            self._set_compare_mode(False)
         if kind == "image":
             self._load_image(path)
         elif kind == "video":
@@ -1001,6 +1240,7 @@ class MediaPlayer(QMainWindow):
         else:
             self._load_media(path, video=False)
         self._update_controls()
+        self._update_compare_headers()
         self._update_status()
 
     def _load_image(self, path):
@@ -1011,6 +1251,7 @@ class MediaPlayer(QMainWindow):
         img = reader.read()
         if img.isNull():
             self.image_view.clear_image()
+            self._image_size = None
             self.hint_label.setText(f"Не удалось открыть:\n{os.path.basename(path)}\n({reader.errorString()})")
             self.stack.setCurrentIndex(0)
             return
@@ -1021,6 +1262,229 @@ class MediaPlayer(QMainWindow):
             self.movie.frameChanged.connect(
                 lambda _: self.image_view.update_frame(self.movie.currentPixmap()))
             self.movie.start()
+        if self._compare_mode and self._compare_sync and self.compare_view.has_image() and not self.compare_view._fit:
+            self._sync_views(self.compare_view, self.image_view)
+
+    # ---------- Сравнение двух фото ----------
+    def toggle_compare(self):
+        self._set_compare_mode(not self._compare_mode)
+
+    def _set_compare_mode(self, enabled):
+        if enabled and self.current_kind() != "image":
+            self.btn_compare.blockSignals(True)
+            self.btn_compare.setChecked(False)
+            self.btn_compare.blockSignals(False)
+            self.status.showMessage("Сравнение доступно при просмотре фото", 3000)
+            return
+        self._compare_mode = bool(enabled)
+        self.btn_compare.blockSignals(True)
+        self.btn_compare.setChecked(self._compare_mode)
+        self.btn_compare.blockSignals(False)
+        self.left_header.setVisible(self._compare_mode)
+        self.right_pane.setVisible(self._compare_mode)
+        if self._compare_mode:
+            if self._compare_path and not os.path.isfile(self._compare_path):
+                self._clear_compare_image()
+            if self._slideshow_active:
+                self._stop_slideshow()
+            self._set_compare_active("right" if self._compare_path is None else self._compare_active)
+            QTimer.singleShot(0, self._equalize_compare_split)
+        else:
+            self._set_compare_active("left")
+            if self.image_view.has_image() and self.image_view._fit:
+                QTimer.singleShot(0, self.image_view._apply_fit)
+        self._update_compare_headers()
+        self._update_status()
+
+    def _equalize_compare_split(self):
+        if not self._compare_mode:
+            return
+        w = max(200, self.image_splitter.width())
+        self.image_splitter.setSizes([w // 2, w - w // 2])
+        if self.image_view.has_image() and self.image_view._fit:
+            self.image_view._apply_fit()
+        if self.compare_view.has_image() and self.compare_view._fit:
+            self.compare_view._apply_fit()
+
+    def _set_compare_active(self, side):
+        self._compare_active = "right" if side == "right" else "left"
+        for hdr, is_act in ((self.left_header, self._compare_active == "left"),
+                            (self.right_header, self._compare_active == "right")):
+            hdr.setProperty("active", "true" if (self._compare_mode and is_act) else "false")
+            hdr.style().unpolish(hdr)
+            hdr.style().polish(hdr)
+
+    def _set_compare_sync(self, enabled):
+        self._compare_sync = bool(enabled)
+        if self._compare_sync and self._compare_mode:
+            src = self.compare_view if self._compare_active == "right" else self.image_view
+            dst = self.image_view if src is self.compare_view else self.compare_view
+            self._sync_views(src, dst)
+
+    def _sync_views(self, src, dst):
+        if not self._compare_mode or not self._compare_sync or self._syncing_views:
+            return
+        if not src.has_image() or not dst.has_image():
+            return
+        self._syncing_views = True
+        try:
+            dst.apply_view_state(src.get_view_state())
+        finally:
+            self._syncing_views = False
+        self._update_status()
+
+    def _active_image_view(self):
+        if self._compare_mode and self._compare_active == "right" and self.compare_view.has_image():
+            return self.compare_view
+        return self.image_view
+
+    def _img_zoom_in(self):
+        self._active_image_view().zoom_in()
+
+    def _img_zoom_out(self):
+        self._active_image_view().zoom_out()
+
+    def _img_zoom_fit(self):
+        self._active_image_view().zoom_fit()
+
+    def _img_zoom_100(self):
+        self._active_image_view().zoom_100()
+
+    def _img_rotate(self, deg):
+        if self._compare_mode and self._compare_sync and self.compare_view.has_image():
+            self.image_view.rotate(deg)
+            self.compare_view.rotate(deg)
+        else:
+            self._active_image_view().rotate(deg)
+        self._update_status()
+
+    def choose_compare_image(self):
+        if self.current_kind() != "image":
+            self.status.showMessage("Сначала откройте первое фото", 3000)
+            return
+        start_dir = (os.path.dirname(self._compare_path)
+                     if self._compare_path and os.path.isdir(os.path.dirname(self._compare_path))
+                     else self._last_dir())
+        filters = (f"Фото ({' '.join('*' + e for e in sorted(IMAGE_EXTS))});;"
+                   "Все файлы (*)")
+        path, _ = QFileDialog.getOpenFileName(self, "Выбрать второе фото для сравнения", start_dir, filters)
+        if path:
+            self._open_in_compare_right(path)
+
+    def _open_in_compare_right(self, path):
+        if self.current_kind() != "image":
+            return
+        if not self._compare_mode:
+            self._set_compare_mode(True)
+        self._load_compare_image(path)
+        self._set_compare_active("right")
+
+    def _stop_compare_movie(self):
+        if self.compare_movie is not None:
+            self.compare_movie.stop()
+            self.compare_movie.deleteLater()
+            self.compare_movie = None
+
+    def _load_compare_image(self, path):
+        self._stop_compare_movie()
+        path = os.path.abspath(path)
+        reader = QImageReader(path)
+        reader.setAutoTransform(True)
+        animated = reader.supportsAnimation() and reader.imageCount() > 1
+        img = reader.read()
+        if img.isNull():
+            self.compare_view.clear_image()
+            self._compare_path = None
+            self._compare_size = None
+            self.compare_hint.setText(f"Не удалось открыть:\n{os.path.basename(path)}\n({reader.errorString()})")
+            self.compare_stack.setCurrentIndex(0)
+            self._update_compare_headers()
+            self._update_status()
+            return
+        self._compare_path = path
+        self._compare_size = img.size()
+        norm = os.path.normcase(path)
+        siblings = [p for p in self._scan_dir(os.path.dirname(path)) if ext_of(p) in IMAGE_EXTS]
+        if not any(os.path.normcase(p) == norm for p in siblings):
+            siblings = [path] + siblings
+        self._compare_files = siblings
+        self.compare_stack.setCurrentIndex(1)
+        self.compare_view.set_image(QPixmap.fromImage(img))
+        if animated:
+            self.compare_movie = QMovie(path, parent=self)
+            self.compare_movie.frameChanged.connect(
+                lambda _: self.compare_view.update_frame(self.compare_movie.currentPixmap()))
+            self.compare_movie.start()
+        if self._compare_sync and self.image_view.has_image() and not self.image_view._fit:
+            self._sync_views(self.image_view, self.compare_view)
+        self._update_compare_headers()
+        self._update_status()
+
+    def _clear_compare_image(self):
+        self._stop_compare_movie()
+        self.compare_view.clear_image()
+        self._compare_path = None
+        self._compare_files = []
+        self._compare_size = None
+        self.compare_hint.setText("Выберите второе фото для сравнения")
+        self.compare_stack.setCurrentIndex(0)
+        self._update_compare_headers()
+
+    def _step_compare_image(self, d):
+        if self._compare_path and self._compare_files:
+            norm = os.path.normcase(self._compare_path)
+            idx = next((i for i, p in enumerate(self._compare_files) if os.path.normcase(p) == norm), 0)
+            nxt = self._compare_files[(idx + d) % len(self._compare_files)]
+            self._load_compare_image(nxt)
+            return
+        img_paths = [f for f in self.files if ext_of(f) in IMAGE_EXTS]
+        if not img_paths:
+            return
+        cur = self.files[self.index] if 0 <= self.index < len(self.files) else None
+        if cur in img_paths:
+            idx = (img_paths.index(cur) + d) % len(img_paths)
+        else:
+            idx = 0 if d > 0 else len(img_paths) - 1
+        self._load_compare_image(img_paths[idx])
+
+    def _swap_compare_images(self):
+        if not self._compare_path or not (0 <= self.index < len(self.files)):
+            return
+        old_left = self.files[self.index]
+        old_right = self._compare_path
+        norm_right = os.path.normcase(old_right)
+        match = next((i for i, p in enumerate(self.files) if os.path.normcase(p) == norm_right), None)
+        if match is not None:
+            self.index = match
+            self._load_current()
+        else:
+            self.open_files([old_right])
+        self._load_compare_image(old_left)
+
+    def _update_compare_headers(self):
+        if 0 <= self.index < len(self.files):
+            lp = self.files[self.index]
+            ls = getattr(self, "_image_size", None)
+            ltxt = os.path.basename(lp)
+            if ls is not None:
+                ltxt += f"  ·  {ls.width()}×{ls.height()}"
+            self.left_title.setText(f"1: {ltxt}")
+            self.left_title.setToolTip(lp)
+        else:
+            self.left_title.setText("1: Фото")
+            self.left_title.setToolTip("")
+
+        if self._compare_path:
+            rtxt = os.path.basename(self._compare_path)
+            if self._compare_size is not None:
+                rtxt += f"  ·  {self._compare_size.width()}×{self._compare_size.height()}"
+            self.right_title.setText(f"2: {rtxt}")
+            self.right_title.setToolTip(self._compare_path)
+            self.right_title.setStyleSheet(f"color:{COLOR_TEXT}; font-size:12px; background:transparent;")
+        else:
+            self.right_title.setText("2: Выберите второе фото")
+            self.right_title.setToolTip("")
+            self.right_title.setStyleSheet(f"color:{COLOR_DIM}; font-size:12px; background:transparent;")
 
     def _ensure_player(self):
         if self.player is not None:
@@ -1120,6 +1584,11 @@ class MediaPlayer(QMainWindow):
     def eventFilter(self, obj, e):
         if obj is self.view_area and e.type() == QEvent.Resize:
             self._place_overlay()
+        elif e.type() == QEvent.MouseButtonPress:
+            if obj is self.left_header:
+                self._set_compare_active("left")
+            elif obj in (self.right_header, self.compare_placeholder):
+                self._set_compare_active("right")
         return super().eventFilter(obj, e)
 
     def _place_overlay(self):
@@ -1131,6 +1600,8 @@ class MediaPlayer(QMainWindow):
 
     def _overlay_wanted(self):
         """Какие большие кнопки нужны для текущего файла."""
+        if self._compare_mode:
+            return []
         kind = self.current_kind()
         if kind is None or self.stack.currentIndex() == 0:
             return []
@@ -1200,6 +1671,19 @@ class MediaPlayer(QMainWindow):
             self.status.clearMessage()
             return
         path = self.files[self.index]
+        if self._compare_mode and self.current_kind() == "image":
+            left_info = os.path.basename(path)
+            if self.image_view.has_image():
+                left_info += f" ({self.image_view._zoom * 100:.0f}%)"
+            if self._compare_path:
+                right_info = os.path.basename(self._compare_path)
+                if self.compare_view.has_image():
+                    right_info += f" ({self.compare_view._zoom * 100:.0f}%)"
+            else:
+                right_info = "не выбрано"
+            sync_txt = "синхр." if self._compare_sync else "независимо"
+            self.status.showMessage(f"Сравнение ({sync_txt})   ·   1: {left_info}   |   2: {right_info}")
+            return
         parts = [f"{self.index + 1} / {len(self.files)}", os.path.basename(path)]
         if self.current_kind() == "image" and self.image_view.has_image():
             s = getattr(self, "_image_size", None)
@@ -1437,6 +1921,8 @@ class MediaPlayer(QMainWindow):
             return
         self._stop_media(release=True)  # иначе Windows не даст удалить открытый файл
         self.image_view.clear_image()
+        if self._compare_path and os.path.normcase(self._compare_path) == os.path.normcase(path):
+            self._clear_compare_image()
         ok = QFile.moveToTrash(path)
         if isinstance(ok, tuple):
             ok = ok[0]
@@ -1458,6 +1944,8 @@ class MediaPlayer(QMainWindow):
         self.files.pop(self.index)
         if not self.files:
             self.index = -1
+            if self._compare_mode:
+                self._set_compare_mode(False)
             self._populate_list()
             self.hint_label.setText("Перетащите сюда фото, видео или музыку")
             self.stack.setCurrentIndex(0)
@@ -1482,6 +1970,16 @@ class MediaPlayer(QMainWindow):
     def dropEvent(self, e):
         paths = [u.toLocalFile() for u in e.mimeData().urls() if u.isLocalFile()]
         if paths:
+            if (self._compare_mode and self.right_pane.isVisible()
+                    and len(paths) == 1 and os.path.isfile(paths[0])
+                    and ext_of(paths[0]) in IMAGE_EXTS):
+                pos_in_right = self.right_pane.mapFrom(self, e.position().toPoint())
+                if self.right_pane.rect().contains(pos_in_right):
+                    self._load_compare_image(paths[0])
+                    self._set_compare_active("right")
+                    self.activateWindow()
+                    e.acceptProposedAction()
+                    return
             self.open_files(paths)
             self.activateWindow()
         e.acceptProposedAction()
@@ -1498,6 +1996,7 @@ class MediaPlayer(QMainWindow):
         self._ov_anim.stop()
         self._save_settings()
         self._stop_slideshow()
+        self._stop_compare_movie()
         self._stop_media(release=True)
         if self.player is not None:
             self.player.setVideoOutput(None)
