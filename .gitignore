@@ -1,0 +1,5 @@
+__pycache__/
+*.py[cod]
+picoplayer_error.log
+player_diagnostic.png
+test_image.png
