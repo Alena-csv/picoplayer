@@ -704,7 +704,6 @@ class MediaPlayer(QMainWindow):
         lpl.setSpacing(0)
         self.left_header = QFrame()
         self.left_header.setObjectName("CompareHeader")
-        self.left_header.installEventFilter(self)
         lhl = QHBoxLayout(self.left_header)
         lhl.setContentsMargins(8, 4, 8, 4)
         lhl.setSpacing(4)
@@ -724,7 +723,6 @@ class MediaPlayer(QMainWindow):
         rpl.setSpacing(0)
         self.right_header = QFrame()
         self.right_header.setObjectName("CompareHeader")
-        self.right_header.installEventFilter(self)
         rhl = QHBoxLayout(self.right_header)
         rhl.setContentsMargins(8, 4, 8, 4)
         rhl.setSpacing(4)
@@ -746,7 +744,6 @@ class MediaPlayer(QMainWindow):
 
         self.compare_stack = QStackedWidget()
         self.compare_placeholder = QWidget()
-        self.compare_placeholder.installEventFilter(self)
         cpl = QVBoxLayout(self.compare_placeholder)
         cpl.addStretch(1)
         self.compare_hint = QLabel("Выберите второе фото для сравнения")
@@ -804,6 +801,9 @@ class MediaPlayer(QMainWindow):
         for b in self.overlay_buttons:
             b.hide()
         self.view_area.installEventFilter(self)
+        self.left_header.installEventFilter(self)
+        self.right_header.installEventFilter(self)
+        self.compare_placeholder.installEventFilter(self)
         self._ov_opacity = 0.0
         self._ov_anim = QVariantAnimation(self)
         self._ov_anim.setDuration(180)
@@ -1582,12 +1582,12 @@ class MediaPlayer(QMainWindow):
 
     # ---------- Большие кнопки поверх просмотра ----------
     def eventFilter(self, obj, e):
-        if obj is self.view_area and e.type() == QEvent.Resize:
+        if obj is getattr(self, "view_area", None) and e.type() == QEvent.Resize:
             self._place_overlay()
         elif e.type() == QEvent.MouseButtonPress:
-            if obj is self.left_header:
+            if obj is getattr(self, "left_header", None):
                 self._set_compare_active("left")
-            elif obj in (self.right_header, self.compare_placeholder):
+            elif obj in (getattr(self, "right_header", None), getattr(self, "compare_placeholder", None)):
                 self._set_compare_active("right")
         return super().eventFilter(obj, e)
 
